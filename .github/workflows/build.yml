@@ -13,16 +13,16 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential
   
-      - name: Checkout rehius/usk
+      - name: Checkout gamemoddesignbr/usk
         uses: actions/checkout@v3
         with:
-          repository: rehius/usk
+          repository: gamemoddesignbr/usk
           path: usk
       
-      - name: Checkout rehius/busk
+      - name: Checkout gamemoddesignbr/busk
         uses: actions/checkout@v3
         with:
-          repository: rehius/busk
+          repository: gamemoddesignbr/busk
           path: busk
 
       - name: Checkout raspberrypi/pico-sdk
