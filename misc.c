@@ -85,7 +85,7 @@ void halt_with_error(uint32_t err, uint32_t bits)
             bool is_long = err & (1 << (bits - i - 1));
             sleep_ms(is_long ? LONG_PAUSE_TIME : SHORT_PAUSE_TIME);
 
-//            bool success = bits == 1 && is_long == 0;
+            bool success = bits == 1 && is_long == 0;
 //            if (success)
             if ((err == 0)) //small change for lighting green only when a successful glitch happens
                 put_pixel(PIX_gre);
