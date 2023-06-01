@@ -2,6 +2,7 @@
 #define PIX_yel 0x151500
 #define PIX_whi 0x111111
 #define PIX_gre 0xFF0000 //PURE GREEN
+#define PIX_red 0x00FF00 //PURE RED
 
 #define PIX_b 0x00000F
 
