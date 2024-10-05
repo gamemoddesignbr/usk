@@ -52,7 +52,10 @@ void finish_pins_except_leds() {
 }
 
 void finish_pins_leds() {
-    gpio_disable_input_output(led_pin());
+    if (!is_tiny())
+    {
+        gpio_disable_input_output(led_pin());
+    }
     gpio_disable_input_output(pwr_pin());
 }
 
@@ -74,11 +77,9 @@ void halt_with_error(uint32_t err, uint32_t bits)
         {
             bool is_long = err & (1 << (bits - i - 1));
             sleep_ms(is_long ? LONG_PAUSE_TIME : SHORT_PAUSE_TIME);
-
             bool success = bits == 1 && is_long == 0;
-//            if (success)
-            if ((err == 0)) //small change for lighting green only when a successful glitch happens
-                put_pixel(PIX_red);
+            if (success)
+                put_pixel(PIX_whi);
             else
                 put_pixel(PIX_yel);
             sleep_ms(is_long ? LONG_TIME : success ? SHORT_TIME * 2 : SHORT_TIME);
@@ -121,7 +122,10 @@ void put_pixel(uint32_t pixel_grb)
     pio_sm_put_blocking(pio0, 3, pixel_grb << 8u);
     sleep_us(50);
     pio_sm_set_enabled(pio0, 3, false);
-    gpio_init(led_pin());
+    if (!is_tiny())
+    {
+        gpio_init(led_pin());
+    }
 }
 
 void gpio_disable_input_output(int pin)
