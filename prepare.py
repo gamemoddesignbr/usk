@@ -37,6 +37,7 @@ open("update.bin", "wb").write(fw)
 
 fw = fw + b"\xFF" * (0x3)
 
-add_blocks(fw, 0x10000000 + 0x10000)
+add_blocks(fw, 0x10000000 + 0x10000)  # fw_slot_0
+add_blocks(fw, 0x10000000 + 0x48000)  # fw_slot_1 — prevents busk fallback to old firmware
 
 open("firmware.uf2", "wb").write(get_uf2())
