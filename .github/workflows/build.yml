@@ -16,19 +16,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential
   
       - name: Checkout gamemoddesignbr/usk
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: gamemoddesignbr/usk
           path: usk
       
       - name: Checkout gamemoddesignbr/busk
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: gamemoddesignbr/busk
           path: busk
 
       - name: Checkout raspberrypi/pico-sdk
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: raspberrypi/pico-sdk
           path: pico-sdk
@@ -53,7 +53,6 @@ jobs:
           cd $GITHUB_WORKSPACE/build/busk
           cmake $GITHUB_WORKSPACE/busk
           make
-          make clean
           cd $GITHUB_WORKSPACE
           # Restore original memmap_default.ld from backup
           rm -f $GITHUB_WORKSPACE/pico-sdk/src/rp2_common/pico_crt0/rp2040/memmap_default.ld
@@ -65,7 +64,6 @@ jobs:
           cd $GITHUB_WORKSPACE/build/usk
           cmake $GITHUB_WORKSPACE/usk
           make
-          make clean
           python3 $GITHUB_WORKSPACE/usk/prepare.py
           cd $GITHUB_WORKSPACE
       - name: Generate release tag
