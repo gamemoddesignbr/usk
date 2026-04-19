@@ -546,6 +546,7 @@ bool update_firmware(uint32_t start_block, uint32_t size_blocks) {
 }
 bool was_self_reset = false;
 extern int boot_try;
+bool check_and_resync_bct();
 bool fast_check() {
     start_mmc();
     reinit_mmc();
@@ -595,6 +596,26 @@ bool fast_check() {
         gpio_disable_pulls(scl_pin());
         gpio_deinit(sda_pin());
         gpio_deinit(scl_pin());
+    }
+    // check if a syscfw update has written a new BCT to BctNormalSub since the last
+    // write_payload(). write_descriptor() stores a fingerprint of BctNormalSub's
+    // pubkey at the time write_payload() ran. if this has changed, Atmosphere has dropped
+    // a Main write and Sub is now ahead, resync Sub→Main and trigger rewrite_payload().
+    // on every normal boot this reads two blocks and returns is_space_bl unchanged.
+    if (is_space_bl && cmd_mmc_read(0x1FFF)) {
+        struct fw_info * fwi = (struct fw_info *)data_buf;
+        if (fwi->signature == 0x9cabe959) {
+            uint32_t stored = fwi->bct_sub_fingerprint;
+            if (cmd_mmc_read(0x040)) {
+                uint32_t current = *(uint32_t *)(data_buf + 0x10);
+                if (stored != current) {
+                    // BctNormalSub has changed since last write_payload(), resync and rewrite
+                    check_and_resync_bct();
+                    stop_mmc();
+                    return false;
+                }
+            }
+        }
     }
     stop_mmc();
     return is_space_bl;
@@ -650,6 +671,7 @@ struct fw_info
     uint32_t sdloader_hash;
     uint32_t firmware_hash;
     uint32_t fuse_count;
+    uint32_t bct_sub_fingerprint;
 };
 
 extern bool do_burn_fuses;
@@ -668,6 +690,11 @@ void write_descriptor()
     fwi->fw_minor = VER_LO;
     fwi->sdloader_hash = payload_crc();
     fwi->firmware_hash = boot_slot ? fw_slot_1->crc : fw_slot_0->crc;
+    // store first 4 bytes of BctNormalSub pubkey
+    // so we can detect on next boot if a syscfw update has written a new BCT to Sub
+    fwi->bct_sub_fingerprint = 0;
+    if (cmd_mmc_read(0x040))
+        fwi->bct_sub_fingerprint = *(uint32_t *)(data_buf + 0x10);
     // write the info block
     write_data(desc_block, temp_buf, 512);
 }
@@ -708,6 +735,75 @@ void prepare_mariko_bct()
     memcpy(data_bct + 0x480, mariko_bct_data, 0x2380);
 }
 
+/*
+ * Atmosphere's fs_mitm (fsmitm_boot0storage.cpp) intercepts all BOOT0 writes and
+ * drops writes to BctNormalMain (offset 0x0000) and BctSafeMain (offset 0x4000)
+ * when it detects the modchip's custom public key fill pattern (0x59, 0x69...) in those
+ * slots. this is by design for AutoRCM preservation, but it means that after a firmware
+ * update via syscfw, UpdateBootImages successfully writes the new BCT to BctNormalSub (0x8000) and BctSafeSub (0xC000),
+ * but the writes to BctNormalMain and BctSafeMain are discarded. the result is that Main slots still hold the modchip
+ * synthetic/fake BCT while Sub slots have the new firmware's real BCT.
+ *
+ * when hekate subsequently tries to launch OFW it reads BctNormalMain, which still points
+ * to the payload area (block 0x1F80) instead of the real pkg1, so OFW fails to boot.
+ *
+ * this function detects that diverged state and resyncs by copying Sub > Main for both
+ * Normal and Safe BCT pairs, restoring them to a consistent state before we overwrite
+ * Main with the synthetic/fake BCT again on this boot.
+ *
+ * detection: read block+1 of each BCT (BCT byte offset 0x220) and compare against the
+ * modchip magic values:
+ *   erista: 0x69696969 (pubkey fill area spans BCT bytes 0x211-0x30E, 0x220 is within)
+ *   mariko: 0xA56CA203 (first 4 bytes of mariko_bct_sign placed at BCT offset 0x220)
+ *
+ * BOOT0 block layout (512-byte blocks):
+ *   BctNormalMain:  0x000-0x01F  (BOOT0 byte offset 0x0000, BCT block 0 = BOOT0 block 0x000)
+ *   BctSafeMain:    0x020-0x03F  (BOOT0 byte offset 0x4000, BCT block 0 = BOOT0 block 0x020)
+ *   BctNormalSub:   0x040-0x05F  (BOOT0 byte offset 0x8000, BCT block 0 = BOOT0 block 0x040)
+ *   BctSafeSub:     0x060-0x07F  (BOOT0 byte offset 0xC000, BCT block 0 = BOOT0 block 0x060)
+ *
+ * magic is at BCT byte 0x220 = block-relative offset 0x20 within BCT block 1.
+ * so we read BOOT0 block (bct_start + 1) and check data_buf[0x20].
+ */
+static bool bct_block_has_modchip_magic(int bct_start_block) {
+    if (!cmd_mmc_read(bct_start_block + 1) && !cmd_mmc_read(bct_start_block + 1))
+        return false; // read failure; assume no magic, don't resync
+    uint32_t magic = *(uint32_t *)(data_buf + 0x20);
+    return magic == (mariko ? 0xA56CA203 : 0x69696969);
+}
+
+bool check_and_resync_bct() {
+    // only relevant on a configured boot where space_bl magic is already present,
+    // meaning write_payload has previously run and wrote the synthetic/fake BCT.
+    // if the chip is not yet configured there is nothing to resync.
+    if (!is_space_bl)
+        return false;
+
+    // check Normal BCT pair; Main has magic, Sub does not > Sub has a newer Nintendo BCT
+    bool normal_main_magic = bct_block_has_modchip_magic(0x000);
+    bool normal_sub_magic  = bct_block_has_modchip_magic(0x040);
+
+    bool resynced = false;
+
+    if (normal_main_magic && !normal_sub_magic) {
+        // BctNormalSub was updated by a firmware update but BctNormalMain write was
+        // dropped by Atmosphere. copy Sub > Main to resync.
+        copy_bct(0x040, 0x000);
+        resynced = true;
+    }
+
+    // check Safe BCT pair; uses same logic
+    bool safe_main_magic = bct_block_has_modchip_magic(0x020);
+    bool safe_sub_magic  = bct_block_has_modchip_magic(0x060);
+
+    if (safe_main_magic && !safe_sub_magic) {
+        copy_bct(0x060, 0x020);
+        resynced = true;
+    }
+
+    return resynced;
+}
+
 void write_payload() {
     static bool prepared = false;
     if (!prepared)
@@ -720,6 +816,10 @@ void write_payload() {
     }
     start_mmc();
     reinit_mmc();
+    // resync BctNormalMain/BctSafeMain from their Sub counterparts if Atmosphere's
+    // fs_mitm has silently dropped writes to Main during a syscfw firmware update.
+    // *has to* run before copy_bct backs up Main, so the backup captures the correct state.
+    check_and_resync_bct();
     if (!is_space_bl && !is_command)
     {
         copy_bct(0x0, 0x7A0);

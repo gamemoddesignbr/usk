@@ -120,10 +120,6 @@ int main()
     // perform payload rewrite if required
     if (!force_check || was_self_reset) {
         rewrite_payload();
-        // reset Switch so BootROM re-runs BCT verification from scratch,
-        // giving the glitch loop a clean timing window on this same RP2040 boot
-        reset_cpu();
-        wait_for_boot(2500);
     }
     // setup the glitch trigger for Mariko
     if (mariko) {
