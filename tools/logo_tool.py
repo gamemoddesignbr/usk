@@ -241,13 +241,13 @@ def compress(data: bytes) -> bytes:
             "Simplify the image (reduce detail, use fewer shades, or increase background area)."
         )
 
-    # Pad compressed data to exactly COMP_DATA_LEN bytes
-    padded = comp_data + b"\x00" * (COMP_DATA_LEN - comp_size)
+    # Stream at HIGH end, zeros at LOW end — matches original payload layout
+    padded = b"\x00" * (COMP_DATA_LEN - comp_size) + comp_data
 
-    # Build tail
-    t0 = comp_size + 12       # total stream size (data without padding + tail)
-    t1 = 12                   # so decompressor r3_start = comp_size - 1
-    t2 = BUF_LEN - comp_size - 12  # t0 + t2 = BUF_LEN
+    # t0 = 2512 constant, t1=12 → r3=2499 (last byte of stream)
+    t0 = LOGO_BLOCK_LEN
+    t1 = LOGO_BLOCK_LEN - COMP_DATA_LEN   # 12
+    t2 = BUF_LEN - LOGO_BLOCK_LEN         # 17968
     tail = struct.pack("<III", t0, t1, t2)
 
     block = padded + tail
@@ -354,7 +354,7 @@ def cmd_convert(args):
     print("Estimating compressed size (this may take 5-15 seconds) ...")
     try:
         block     = compress(buf)
-        comp_data = block[:COMP_DATA_LEN].rstrip(b"\x00")
+        actual_comp_size = len(block[:COMP_DATA_LEN].lstrip(b" "))
         print(f"Estimated compressed size: {len(comp_data)} / {COMP_DATA_LEN} bytes "
               f"({len(comp_data)/COMP_DATA_LEN*100:.1f}% of budget used)")
     except ValueError as e:
@@ -385,8 +385,8 @@ def cmd_inject(args):
         print(f"ERROR: {e}")
         sys.exit(1)
 
-    comp_data = block[:COMP_DATA_LEN].rstrip(b"\x00")
-    print(f"  Compressed: {len(comp_data)} / {COMP_DATA_LEN} bytes used")
+    actual_comp_size = len(block[:COMP_DATA_LEN].lstrip(b" "))
+    print(f"  Compressed: {actual_comp_size} / {COMP_DATA_LEN} bytes used")
 
     # Backup
     bak_path = payload_path.with_suffix(".h.bak")

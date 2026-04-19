@@ -65,7 +65,8 @@ void init_glitch_pio() {
 }
 
 void deinit_glitch_pio() {
-    pio_set_sm_mask_enabled(pio1, 0x3, false);
+    // SM 2 (G_DAT0_SM) is also used, so all 3 state machines need to be disabled (0x7 = 0b111)
+    pio_set_sm_mask_enabled(pio1, 0x7, false);
     for (int i = PIN_CLK; i <= PIN_DAT; i++)
     {
             gpio_deinit(i);

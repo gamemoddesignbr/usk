@@ -55,7 +55,7 @@ void self_test()
 {
     absolute_time_t tio_time = make_timeout_time_ms(2500);
     adc_init();
-    bool rst_ok = false, cmd_ok = false, d0_ok = false, clk_ok = false;
+    bool rst_ok = false, cmd_ok = false, d0_ok = false;
     while (!time_reached(tio_time)) {
         if (!rst_ok)
             rst_ok |= safe_test_voltage(PIN_RST, 1.8f, 0.2f);

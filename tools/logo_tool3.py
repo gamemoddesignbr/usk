@@ -255,13 +255,15 @@ def compress(data: bytes) -> bytes:
             "Simplify the image (reduce detail, use fewer shades, or increase background area)."
         )
 
-    # Pad compressed data to exactly COMP_DATA_LEN bytes
-    padded = comp_data + b"\x00" * (COMP_DATA_LEN - comp_size)
+    # Place compressed stream at the HIGH end of the data area, zeros at the LOW end.
+    # This matches the original payload layout (IRAM 0x40009278 must remain zero-prefixed).
+    # Original: stream at [7..2495], zeros at [0..6].  Ours: stream at [2500-N..2499], zeros at [0..2499-N].
+    padded = b"\x00" * (COMP_DATA_LEN - comp_size) + comp_data
 
-    # Build tail
-    t0 = comp_size + 12       # total stream size (data without padding + tail)
-    t1 = 12                   # so decompressor r3_start = comp_size - 1
-    t2 = BUF_LEN - comp_size - 12  # t0 + t2 = BUF_LEN
+    # t0 = total block size (constant 2512), t1 = 12 → r3 = 2499 (last byte of stream)
+    t0 = LOGO_BLOCK_LEN       # 2512 — constant, never depends on comp_size
+    t1 = LOGO_BLOCK_LEN - COMP_DATA_LEN   # 12
+    t2 = BUF_LEN - LOGO_BLOCK_LEN         # 17968
     tail = struct.pack("<III", t0, t1, t2)
 
     block = padded + tail
@@ -431,8 +433,8 @@ def cmd_inject(args):
         print(f"ERROR: {e}")
         sys.exit(1)
 
-    comp_data = block[:COMP_DATA_LEN].rstrip(b"\x00")
-    print(f"  Compressed: {len(comp_data)} / {COMP_DATA_LEN} bytes used")
+    actual_comp_size = len(block[:COMP_DATA_LEN].lstrip(b"\x00"))
+    print(f"  Compressed: {actual_comp_size} / {COMP_DATA_LEN} bytes used")
 
     # Backup
     bak_path = payload_path.with_suffix(".h.bak")
