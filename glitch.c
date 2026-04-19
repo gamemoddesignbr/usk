@@ -90,7 +90,7 @@ int do_glitch(int delay, int width, int total_ms, int after_ms) {
     int result = GLITCH_RESULT_MISSING;
     bool detected = false;
 
-    absolute_time_t detect_time = make_timeout_time_ms(50);
+    absolute_time_t detect_time = make_timeout_time_ms(20);
     absolute_time_t full_time = make_timeout_time_ms(total_ms);
     absolute_time_t tio_time = detect_time;
 
