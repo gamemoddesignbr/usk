@@ -544,6 +544,17 @@ bool update_firmware(uint32_t start_block, uint32_t size_blocks) {
     }
     return true;
 }
+struct fw_info
+{
+    uint32_t signature;
+    uint32_t fw_major;
+    uint32_t fw_minor;
+    uint32_t sdloader_hash;
+    uint32_t firmware_hash;
+    uint32_t fuse_count;
+    uint32_t bct_sub_fingerprint;
+};
+
 bool was_self_reset = false;
 extern int boot_try;
 bool check_and_resync_bct();
@@ -662,17 +673,6 @@ void copy_bct(int start, int end) {
         }
     }
 }
-
-struct fw_info
-{
-    uint32_t signature;
-    uint32_t fw_major;
-    uint32_t fw_minor;
-    uint32_t sdloader_hash;
-    uint32_t firmware_hash;
-    uint32_t fuse_count;
-    uint32_t bct_sub_fingerprint;
-};
 
 extern bool do_burn_fuses;
 
