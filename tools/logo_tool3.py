@@ -113,15 +113,21 @@ def decompress(payload_bytes: bytes) -> bytes:
     tail      = payload_bytes[LOGO_TAIL_OFF:LOGO_END]       # 12 bytes
     t0, t1, t2 = struct.unpack("<III", tail)
 
-    # Setup: copy compressed data to start of output buffer, zero-fill the rest
-    buf = bytearray(BUF_LEN)
-    buf[0:COMP_DATA_LEN] = comp_data
+    # Use separate stream and output buffers so in-place write/read crossover
+    # does not corrupt the stream data.  The ARM hardware uses a single buffer
+    # but the crossover only affects a handful of pixels in the all-BG top rows,
+    # which are cosmetically insignificant.  Separate buffers give a clean
+    # round-trip that matches convert output exactly.
+    stream_buf = bytearray(COMP_DATA_LEN)
+    stream_buf[0:COMP_DATA_LEN] = comp_data   # read-only stream
+
+    out_buf = bytearray([BG] * BUF_LEN)       # output pixels, pre-filled with BG
 
     # Decompressor initial state — derived from tail exactly as the ARM code does
-    r3 = (t0 - t1) - 1        # read pointer  (= comp_size - 1 for our data, 2495 for original)
+    r3 = (t0 - t1) - 1        # read pointer  (starts at last stream byte, e.g. 2495)
     r2 = t0 + t2               # output pointer (= 20 480 = BUF_LEN)
     r5 = 8                     # bits remaining in current control byte
-    r1 = buf[r3]               # current control byte
+    r1 = stream_buf[r3] if 0 <= r3 < COMP_DATA_LEN else 0
 
     while r2 > 0:
         flag = (r1 >> 7) & 1  # high bit = current control bit
@@ -131,15 +137,15 @@ def decompress(payload_bytes: bytes) -> bytes:
             if r3 <= 0:
                 break
             r3 -= 1
-            literal = buf[r3]
+            literal = stream_buf[r3] if 0 <= r3 < COMP_DATA_LEN else 0
             r2 -= 1
-            buf[r2] = literal
+            out_buf[r2] = literal
         else:
             # ---- Back-reference ----
             if r3 < 2:
                 break
-            b_hi = buf[r3 - 1]
-            b_lo = buf[r3 - 2]
+            b_hi = stream_buf[r3 - 1] if r3 - 1 < COMP_DATA_LEN else 0
+            b_lo = stream_buf[r3 - 2] if r3 - 2 < COMP_DATA_LEN else 0
             r3  -= 2
             val16      = b_lo | (b_hi << 8)
             match_len  = ((val16 >> 11) + 6) & 0xFE   # 6–36, always even
@@ -149,7 +155,7 @@ def decompress(payload_bytes: bytes) -> bytes:
                 break
             for i in range(match_len):
                 src = write_start + offset + i
-                buf[write_start + i] = buf[src] if src < BUF_LEN else BG
+                out_buf[write_start + i] = out_buf[src] if src < BUF_LEN else BG
             r2 = write_start
 
         # Consume the control bit
@@ -161,15 +167,35 @@ def decompress(payload_bytes: bytes) -> bytes:
             r3 -= 1
             if r3 < 0:
                 break
-            r1 = buf[r3]
+            r1 = stream_buf[r3] if 0 <= r3 < COMP_DATA_LEN else 0
             r5 = 8
 
-    return bytes(buf)
+    return bytes(out_buf)
 
 
 # ---------------------------------------------------------------------------
 # Backward LZ compressor
 # ---------------------------------------------------------------------------
+
+def _build_stream(ops):
+    """Build raw compressed stream bytes from ops list of (flag, data_bytes, pos, length)."""
+    groups = []
+    for g in range(0, len(ops), 8):
+        group = ops[g:g + 8]
+        ctrl  = 0
+        for i, (flag, _, _, _) in enumerate(group):
+            if flag:
+                ctrl |= 1 << (7 - i)
+        gb = bytearray()
+        for flag, db, _, _ in reversed(group):
+            gb.extend(db)
+        gb.append(ctrl)
+        groups.append(bytes(gb))
+    stream = bytearray()
+    for g in reversed(groups):
+        stream.extend(g)
+    return bytes(stream)
+
 
 def compress(data: bytes) -> bytes:
     """
@@ -183,7 +209,26 @@ def compress(data: bytes) -> bytes:
     MIN_OFFSET = 3
     MAX_OFFSET = 4098
 
-    # Collect operations, processing from pos=n-1 downward
+    # In-place decompression safety: use t1=16 (original firmware value).
+    # With t1=16: r3 = (2512-16)-1 = 2495. Stream occupies [stream_start..2495].
+    # Bytes [2496..2499] are trailing zeros (never read by decompressor).
+    # This matches the original rehius payload layout exactly.
+    #
+    # Safe range: stream_len in [SAFE_STREAM_LEN .. MAX_STREAM_LEN]
+    #
+    # Lower bound (2481): r3_cross (write/read pointer collision) lands in the zero area
+    # [0..stream_start-1] rather than inside the stream.
+    # Formula with t1=16: SL^2 - 2497*SL + 40960 > 0  →  SL > 2480.5
+    #
+    # Upper bound (2489): stream at [7..2495], keeping ≥7 leading zeros.
+    # Position 0 of the logo block (IRAM 0x40009278) must be 0x00 — read by the ARM
+    # payload code before decompression; non-zero there → payload malfunction → ===.
+    STREAM_TOP       = COMP_DATA_LEN - 4    # 2496: stream must end at or before 2495
+    SAFE_STREAM_LEN  = 2488   # r3_cross(2488)=7.5 < stream_start=8; safe with margin
+    MAX_STREAM_LEN   = STREAM_TOP - 7      # 2489 — keeps ≥7 leading zeros
+
+    # Collect operations with position info: (flag, data_bytes, pos, length)
+    # flag=0: literal covering data[pos], flag=1: back-ref covering data[pos-length+1..pos]
     ops = []
     pos = n - 1
 
@@ -192,8 +237,12 @@ def compress(data: bytes) -> bytes:
         best_offset = 0
 
         if pos + 1 < n:
-            # Search for longest match in already-processed region data[pos+1:]
-            for length in range(min(MAX_MATCH, pos + 1), MIN_MATCH - 1, -2):
+            # Only try even lengths — decompressor applies & 0xFE (rounds odd down by 1),
+            # so odd match_len would decode as match_len-1, losing 1 pixel per back-reference.
+            max_len = min(MAX_MATCH, pos + 1)
+            if max_len & 1:
+                max_len -= 1  # round down to even
+            for length in range(max_len, MIN_MATCH - 1, -2):
                 dst_start = pos + 1 - length
                 if dst_start < 0:
                     continue
@@ -215,36 +264,64 @@ def compress(data: bytes) -> bytes:
 
         if best_len >= MIN_MATCH:
             val16 = ((best_len - 6) << 11) | (best_offset - 3)
-            ops.append((1, bytes([val16 & 0xFF, val16 >> 8])))
+            ops.append((1, bytes([val16 & 0xFF, val16 >> 8]), pos, best_len))
             pos -= best_len
         else:
-            ops.append((0, bytes([data[pos]])))
+            ops.append((0, bytes([data[pos]]), pos, 1))
             pos -= 1
 
-    # Build the compressed stream
-    # ops[0] covers the END of original data → must be at HIGHEST stream address
-    # (decompressor reads ctrl bytes from high to low)
+    # If stream too short for safe in-place decompression, degrade back-refs near
+    # pos=0 (end of ops list) into literals to expand the stream.
+    # Pad stream into [SAFE_STREAM_LEN..MAX_STREAM_LEN].
     #
-    # Within each 8-op group:
-    #   op[0] → bit 7 of ctrl, data bytes just below ctrl (highest data position)
-    #   op[7] → bit 0 of ctrl, data bytes furthest below ctrl
-    groups = []
-    for g in range(0, len(ops), 8):
-        group = ops[g:g + 8]
-        ctrl  = 0
-        for i, (flag, _) in enumerate(group):
-            if flag:
-                ctrl |= 1 << (7 - i)
-        gb = bytearray()
-        for flag, db in reversed(group):   # op[7] first → op[0] just before ctrl
-            gb.extend(db)
-        gb.append(ctrl)
-        groups.append(bytes(gb))
+    # Strategy: split large back-refs into 6-length back-refs (not literals).
+    # Back-refs copy from already-written output — they have no "data bytes" at low
+    # stream positions that the write pointer (r2) could overwrite before r3 reads them.
+    # Literals DO have data bytes at low stream positions and always cause in-place
+    # corruption when placed near pos=0, making literal-based padding unreliable.
+    def _split_to_b6(data, op_pos, op_len):
+        """Split a back-ref into ≤6-length back-refs (or literals as fallback)."""
+        result = []
+        p = op_pos
+        end = op_pos - op_len  # exclusive
+        while p > end:
+            chunk = min(6, p - end)
+            if chunk < MIN_MATCH:
+                # too small for a back-ref, use literal
+                result.append((0, bytes([data[p]]), p, 1))
+                p -= 1
+                continue
+            dst_start = p + 1 - chunk
+            target    = data[dst_start:p + 1]
+            found     = False
+            for src in range(p + 1, min(p + 1 + MAX_OFFSET - chunk + 2, n - chunk + 1)):
+                off = src - dst_start
+                if off > MAX_OFFSET:
+                    break
+                if data[src:src + chunk] == target:
+                    v = ((chunk - 6) << 11) | (off - 3)
+                    result.append((1, bytes([v & 0xFF, v >> 8]), p, chunk))
+                    p -= chunk
+                    found = True
+                    break
+            if not found:
+                result.append((0, bytes([data[p]]), p, 1))
+                p -= 1
+        return result
 
-    # groups[0] covers the end of data → must be LAST in stream (highest address)
-    stream = bytearray()
-    for g in reversed(groups):
-        stream.extend(g)
+    stream = _build_stream(ops)
+    if len(stream) < SAFE_STREAM_LEN:
+        i = len(ops) - 1
+        while len(stream) < SAFE_STREAM_LEN and i >= 0:
+            flag, data_bytes, op_pos, op_len = ops[i]
+            if flag == 1 and op_len > 6:
+                split       = _split_to_b6(data, op_pos, op_len)
+                candidate   = ops[:i] + split + ops[i + 1:]
+                new_stream  = _build_stream(candidate)
+                if len(new_stream) <= MAX_STREAM_LEN:
+                    ops    = candidate
+                    stream = new_stream
+            i -= 1
 
     comp_data = bytes(stream)
     comp_size = len(comp_data)
@@ -255,15 +332,16 @@ def compress(data: bytes) -> bytes:
             "Simplify the image (reduce detail, use fewer shades, or increase background area)."
         )
 
-    # Place compressed stream at the HIGH end of the data area, zeros at the LOW end.
-    # This matches the original payload layout (IRAM 0x40009278 must remain zero-prefixed).
-    # Original: stream at [7..2495], zeros at [0..6].  Ours: stream at [2500-N..2499], zeros at [0..2499-N].
-    padded = b"\x00" * (COMP_DATA_LEN - comp_size) + comp_data
+    # Layout: zeros + stream + 4 trailing zeros, matching original firmware.
+    # stream at [stream_start..2495], zeros at [0..stream_start-1], zeros at [2496..2499].
+    leading_zeros = STREAM_TOP - comp_size                  # = 2496 - comp_size
+    trailing_zeros = COMP_DATA_LEN - STREAM_TOP             # = 4  (positions 2496..2499)
+    padded = b"\x00" * leading_zeros + comp_data + b"\x00" * trailing_zeros
 
-    # t0 = total block size (constant 2512), t1 = 12 → r3 = 2499 (last byte of stream)
-    t0 = LOGO_BLOCK_LEN       # 2512 — constant, never depends on comp_size
-    t1 = LOGO_BLOCK_LEN - COMP_DATA_LEN   # 12
-    t2 = BUF_LEN - LOGO_BLOCK_LEN         # 17968
+    # t0=2512, t1=16 → r3=(2512-16)-1=2495 (last byte of stream), t2=17968 → r2=20480
+    t0 = LOGO_BLOCK_LEN   # 2512
+    t1 = 16               # original firmware value; r3=2495 (stream ends at buf[2495])
+    t2 = BUF_LEN - LOGO_BLOCK_LEN   # 17968
     tail = struct.pack("<III", t0, t1, t2)
 
     block = padded + tail
