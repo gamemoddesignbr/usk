@@ -1,1 +1,4 @@
 tools/__pycache__/
+tools/tmp/
+tools/logo_extracted.png
+tools/logo_extracted_4x.png
