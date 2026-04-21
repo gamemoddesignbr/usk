@@ -3,19 +3,11 @@ import struct, zlib
 blocks = []
 last_off = 0x10000000
 
-# Glitch records live at CONFIG_START=0x8000 (flash 0x10008000), size CONFIG_SIZE=88*256=0x5800.
-# Skip this region when filling gaps so records survive UF2 reflash.
-RECORDS_START = 0x10008000
-RECORDS_END   = 0x1000D800  # 0x10008000 + 0x5800
-
 def add_block(data, offset):
     global last_off
     if last_off != offset:
         for i in range((offset - last_off) // 256):
-            addr = last_off + i * 256
-            if RECORDS_START <= addr < RECORDS_END:
-                continue  # preserve glitch records
-            blocks.append((b"\xFF" * 256, addr))
+            blocks.append((b"\xFF" * 256, last_off + i * 256))
     assert len(data) == 256
     blocks.append((data, offset))
     last_off = offset + 256
