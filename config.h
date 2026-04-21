@@ -15,7 +15,7 @@ int find_best_record(int * max_weight);
 bool fast_check();
 int get_weigth(int offset);
 
-#define CONFIG_START 0x8000 // change to 0x100000 when compiling in "default mode"
+#define CONFIG_START 0x100000 // records at 0x10100000 — above gap-fill range, survives UF2 reflash
 #define CONFIG_IDX(offset) (((offset - OFFSET_MIN) / OFFSET_DIV) + 1)
 #define CONFIG_CNT CONFIG_IDX(OFFSET_MAX)
 #define OFFSET_CNT (CONFIG_CNT-1)
