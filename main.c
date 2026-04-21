@@ -150,7 +150,7 @@ int main()
                 for(int y = 0; y < OFFSET_CNT; y++)
                 {
                     offset = offsets_array[y];
-                    glitched = glitch_try_offset(offset, &width, 4);
+                    glitched = glitch_try_offset(offset, &width, 20);
                     if (glitched)
                         break;
                 }
