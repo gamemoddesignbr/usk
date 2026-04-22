@@ -45,11 +45,13 @@ LOGO_BLOCK_LEN = LOGO_END - LOGO_OFFSET   # = 2512 bytes (DO NOT CHANGE)
 COMP_DATA_LEN  = LOGO_TAIL_OFF - LOGO_OFFSET  # = 2500 bytes of compressed data
 
 # In-place decompression safety constraint (see compress() for derivation)
-MAX_MATCH        = 36     # decompressor max back-ref length (0xF8F8 → 37+6-1 rounded even = 36... actually from formula: ((0xF8F8>>11)+6)&0xFE)
-MIN_LEADING_ZEROS = 37   # stream_start must be ≥ MAX_MATCH+1 to prevent write_start<0
+MAX_MATCH        = 36     # decompressor max back-ref length
+# stream_start=7 (MIN_LEADING_ZEROS=7) matches rehius: r2 wraps near end,
+# writes 0xF8 pixels to IRAM 0x4003AFxx (below output_buf). Required for glitch to work.
+MIN_LEADING_ZEROS = 7    # keep 7 leading zeros like rehius (stream_start=7)
 STREAM_TOP       = COMP_DATA_LEN - 4          # 2496: stream ends at position 2495
-MAX_STREAM_LEN   = STREAM_TOP - MIN_LEADING_ZEROS  # 2459: safe upper bound for stream
-SAFE_STREAM_LEN  = 2440                       # trigger back-ref degradation below max
+MAX_STREAM_LEN   = STREAM_TOP - MIN_LEADING_ZEROS  # 2489: matches rehius stream range
+SAFE_STREAM_LEN  = 2485                       # degrade back-refs to expand stream toward max
 
 # Output buffer dimensions
 BUF_W   = 80
@@ -221,7 +223,8 @@ def compress(data: bytes) -> bytes:
     # Bytes [2496..2499] are trailing zeros (never read by decompressor).
     # This matches the original rehius payload layout exactly.
     #
-    # Uses module-level safety constants: MAX_STREAM_LEN=2459, SAFE_STREAM_LEN=2440.
+    # Uses module-level constants: MIN_LEADING_ZEROS=7, MAX_STREAM_LEN=2489, SAFE_STREAM_LEN=2485.
+    # stream_start=7 matches rehius: ARM r2 wraps unsigned near end, writes to IRAM 0x4003AFxx.
     # Position 0 of logo block must be 0x00 (ARM reads it before decompression).
 
     # Collect operations with position info: (flag, data_bytes, pos, length)
