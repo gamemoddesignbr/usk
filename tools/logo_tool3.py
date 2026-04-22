@@ -44,6 +44,13 @@ LOGO_END       = 0x5E88   # First byte after the block (= LOGO_TAIL_OFF + 12)
 LOGO_BLOCK_LEN = LOGO_END - LOGO_OFFSET   # = 2512 bytes (DO NOT CHANGE)
 COMP_DATA_LEN  = LOGO_TAIL_OFF - LOGO_OFFSET  # = 2500 bytes of compressed data
 
+# In-place decompression safety constraint (see compress() for derivation)
+MAX_MATCH        = 36     # decompressor max back-ref length (0xF8F8 → 37+6-1 rounded even = 36... actually from formula: ((0xF8F8>>11)+6)&0xFE)
+MIN_LEADING_ZEROS = 37   # stream_start must be ≥ MAX_MATCH+1 to prevent write_start<0
+STREAM_TOP       = COMP_DATA_LEN - 4          # 2496: stream ends at position 2495
+MAX_STREAM_LEN   = STREAM_TOP - MIN_LEADING_ZEROS  # 2459: safe upper bound for stream
+SAFE_STREAM_LEN  = 2440                       # trigger back-ref degradation below max
+
 # Output buffer dimensions
 BUF_W   = 80
 BUF_H   = 256
@@ -214,18 +221,8 @@ def compress(data: bytes) -> bytes:
     # Bytes [2496..2499] are trailing zeros (never read by decompressor).
     # This matches the original rehius payload layout exactly.
     #
-    # Safe range: stream_len in [SAFE_STREAM_LEN .. MAX_STREAM_LEN]
-    #
-    # Lower bound (2481): r3_cross (write/read pointer collision) lands in the zero area
-    # [0..stream_start-1] rather than inside the stream.
-    # Formula with t1=16: SL^2 - 2497*SL + 40960 > 0  →  SL > 2480.5
-    #
-    # Upper bound (2489): stream at [7..2495], keeping ≥7 leading zeros.
-    # Position 0 of the logo block (IRAM 0x40009278) must be 0x00 — read by the ARM
-    # payload code before decompression; non-zero there → payload malfunction → ===.
-    STREAM_TOP       = COMP_DATA_LEN - 4    # 2496: stream must end at or before 2495
-    SAFE_STREAM_LEN  = 2488   # r3_cross(2488)=7.5 < stream_start=8; safe with margin
-    MAX_STREAM_LEN   = STREAM_TOP - 7      # 2489 — keeps ≥7 leading zeros
+    # Uses module-level safety constants: MAX_STREAM_LEN=2459, SAFE_STREAM_LEN=2440.
+    # Position 0 of logo block must be 0x00 (ARM reads it before decompression).
 
     # Collect operations with position info: (flag, data_bytes, pos, length)
     # flag=0: literal covering data[pos], flag=1: back-ref covering data[pos-length+1..pos]
@@ -326,10 +323,11 @@ def compress(data: bytes) -> bytes:
     comp_data = bytes(stream)
     comp_size = len(comp_data)
 
-    if comp_size > COMP_DATA_LEN:
+    if comp_size > MAX_STREAM_LEN:
         raise ValueError(
-            f"Compressed data is {comp_size} bytes, exceeds budget of {COMP_DATA_LEN} bytes. "
-            "Simplify the image (reduce detail, use fewer shades, or increase background area)."
+            f"Compressed stream is {comp_size} bytes, exceeds safe limit of {MAX_STREAM_LEN} bytes "
+            f"(stream_start must be ≥ {MIN_LEADING_ZEROS} to prevent IRAM corruption during "
+            "in-place decompression). Simplify logo: increase --threshold, reduce detail, or scale smaller."
         )
 
     # Layout: zeros + stream + 4 trailing zeros, matching original firmware.
@@ -346,7 +344,7 @@ def compress(data: bytes) -> bytes:
 
     block = padded + tail
     assert len(block) == LOGO_BLOCK_LEN
-    return block
+    return block, comp_size
 
 
 # ---------------------------------------------------------------------------
@@ -473,10 +471,9 @@ def cmd_convert(args):
     # Compression estimate
     print("Estimating compressed size (this may take 5-15 seconds) ...")
     try:
-        block     = compress(buf)
-        comp_data = block[:COMP_DATA_LEN].rstrip(b"\x00")
-        print(f"Estimated compressed size: {len(comp_data)} / {COMP_DATA_LEN} bytes "
-              f"({len(comp_data)/COMP_DATA_LEN*100:.1f}% of budget used)")
+        block, stream_len = compress(buf)
+        print(f"Estimated stream size: {stream_len} / {MAX_STREAM_LEN} bytes safe limit "
+              f"({'OK' if stream_len <= MAX_STREAM_LEN else 'UNSAFE — reduce logo detail'})")
     except ValueError as e:
         print(f"WARNING: {e}")
 
@@ -506,13 +503,12 @@ def cmd_inject(args):
 
     print("Compressing (this may take 5-15 seconds) ...")
     try:
-        block = compress(buf)
+        block, stream_len = compress(buf)
     except ValueError as e:
         print(f"ERROR: {e}")
         sys.exit(1)
 
-    actual_comp_size = len(block[:COMP_DATA_LEN].lstrip(b"\x00"))
-    print(f"  Compressed: {actual_comp_size} / {COMP_DATA_LEN} bytes used")
+    print(f"  Stream size: {stream_len} / {MAX_STREAM_LEN} bytes safe limit (OK)")
 
     # Backup
     bak_path = payload_path.with_suffix(".h.bak")
