@@ -401,7 +401,7 @@ def image_to_logo_buffer(
     img.thumbnail((BUF_W, BUF_H), Image.LANCZOS)
 
     # Step 6 — place centered on the canvas and remap pixel values
-    canvas = Image.new("L", (BUF_W, BUF_H), BG)
+    canvas = Image.new("L", (BUF_W, BUF_H), 255)
     x_off  = (BUF_W - img.width)  // 2
     y_off  = (BUF_H - img.height) // 2
     canvas.paste(img, (x_off, y_off))
