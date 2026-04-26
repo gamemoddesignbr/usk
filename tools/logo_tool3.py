@@ -333,11 +333,13 @@ def compress(data: bytes) -> bytes:
             "in-place decompression). Simplify logo: increase --threshold, reduce detail, or scale smaller."
         )
 
-    # Layout: zeros + stream + 4 trailing zeros, matching original firmware.
-    # stream at [stream_start..2495], zeros at [0..stream_start-1], zeros at [2496..2499].
+    # Layout: zeros + stream + 4 trailing 0xFF bytes, matching original firmware.
+    # stream at [stream_start..2495], zeros at [0..stream_start-1], 0xFF at [2496..2499].
+    # Rehius has 0xFF at positions 2496..2499 (its stream extends there); ARM checks for
+    # this pattern before decompressing. 0x00 here causes silent ARM payload failure (===).
     leading_zeros = STREAM_TOP - comp_size                  # = 2496 - comp_size
     trailing_zeros = COMP_DATA_LEN - STREAM_TOP             # = 4  (positions 2496..2499)
-    padded = b"\x00" * leading_zeros + comp_data + b"\x00" * trailing_zeros
+    padded = b"\x00" * leading_zeros + comp_data + b"\xFF" * trailing_zeros
 
     # t0=2512, t1=16 → r3=(2512-16)-1=2495 (last byte of stream), t2=17968 → r2=20480
     t0 = LOGO_BLOCK_LEN   # 2512
