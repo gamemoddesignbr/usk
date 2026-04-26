@@ -341,6 +341,43 @@ def compress(data: bytes) -> bytes:
     trailing_zeros = COMP_DATA_LEN - STREAM_TOP             # = 4  (positions 2496..2499)
     padded = b"\x00" * leading_zeros + comp_data + b"\xFF" * trailing_zeros
 
+    # Fix: inject rehius-compatible background encoding at stream[0:340].
+    #
+    # The ARM payload at 0x088A reads IRAM ~0x4003AFDD and checks it != 0.
+    # That address only gets written (with 0xF8) when the in-place decompressor's
+    # first wrap fires at write_start=-35, i.e. r2=1 before the wrap-triggering
+    # back-ref. Rehius achieves r2=1; our padding loop splits ml=36 ops into ml=6,
+    # causing in-place corruption that moves the wrap to r2=8 (write_start=-28),
+    # missing address 0x4003AFDD → ARM check fails → no success signal → ===.
+    #
+    # These 340 bytes encode ~5760 all-background (0xF8) pixels using ml=36
+    # back-refs — decompressed output identical to our logo at those positions.
+    # Replacing stream[0:340] with this patch forces the wrap at r2=1.
+    _REHIUS_BG_PATCH = bytes.fromhex(
+        "f80021f021f021f021f021f021f021f021f0ff21"
+        "f021f021f021f021f021f021f021f0ff21f021f0"
+        "21f021f021f021f021f021f0ff21f021f021f021"
+        "f021f021f021f021f0ff21f021f021f021f021f0"
+        "21f021f021f0ff21f021f021f021f021f021f021"
+        "f021f0ff21f021f021f021f021f021f021f021f0"
+        "ff21f021f021f021f021f021f021f021f0ff21f0"
+        "21f021f021f021f021f021f021f0ff21f021f021"
+        "f021f021f021f021f021f0ff21f021f021f021f0"
+        "21f021f021f021f0ff21f021f021f021f021f021"
+        "f021f021f0ff21f021f021f021f021f021f021f0"
+        "21f0ff21f021f021f021f021f021f021f021f0ff"
+        "21f021f021f021f021f021f021f021f0ff21f021"
+        "f021f021f021f021f021f021f0ff21f021f021f0"
+        "21f021f021f021f021f0ff21f021f021f021f021"
+        "f021f021f021f0ff21f021f021f021f021f021f0"
+        "21f021f0ff21f021f021f021f021f021f021f031"
+    )
+    _patch_len = len(_REHIUS_BG_PATCH)  # 340
+    if len(padded) >= leading_zeros + _patch_len:
+        padded = (padded[:leading_zeros]
+                  + _REHIUS_BG_PATCH
+                  + padded[leading_zeros + _patch_len:])
+
     # t0=2512, t1=16 → r3=(2512-16)-1=2495 (last byte of stream), t2=17968 → r2=20480
     t0 = LOGO_BLOCK_LEN   # 2512
     t1 = 16               # original firmware value; r3=2495 (stream ends at buf[2495])
